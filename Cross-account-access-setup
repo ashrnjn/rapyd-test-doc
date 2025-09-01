@@ -1,0 +1,208 @@
+Cross-Account EC2 Management via AWS SSM (Account-A → Account-B)
+Overview
+This documentation explains how to enable cross-account management of EC2 instances in Account-B using orchestration tools (Ansible, Octopus, Chef) running in Account-A, without SSH access. All management is performed via AWS Systems Manager (SSM).
+Key Requirements:
+•	EC2 instances in Account-B have no public IP.
+•	Remote management is SSM-only.
+•	Cross-account IAM permissions allow Account-A to manage EC2 instances in Account-B.
+________________________________________
+Architecture
++----------------+                 +------------------+
+| Account A      |                 | Account B        |
+| (Orchestration)|                 | (EC2 Instances)  |
+|                |                 |                  |
+|  Ansible/      |  AssumeRole     |  IAM Role w/     |
+|  Octopus/Chef  +----------------->  SSM Managed     |
+| Terraform      |                 |  EC2 Role        |
++----------------+                 +------------------+
+                                     |
+                                     |  Private Subnet
+                                     v
+                               +----------------+
+                               | VPC + Endpoints|
+                               +----------------+
+Notes:
+•	EC2 instances reside in a private subnet.
+•	SSM requires VPC endpoints (ssm, ssmmessages, ec2messages) for private connectivity. Optional KMS endpoint if session encryption is used.
+________________________________________
+Step 1: Create IAM Role in Account-B for EC2 (SSM Managed)
+The EC2 instance needs a role for SSM, attached via an instance profile.
+Terraform Example:
+resource "aws_iam_role" "ec2_ssm_role" {
+  name = "EC2SSMRole"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17",
+    Statement = [{
+      Effect = "Allow",
+      Principal = { Service = "ec2.amazonaws.com" },
+      Action = "sts:AssumeRole"
+    }]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "ec2_ssm_managed_policy" {
+  role       = aws_iam_role.ec2_ssm_role.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+}
+
+resource "aws_iam_instance_profile" "ec2_ssm_profile" {
+  name = "EC2SSMInstanceProfile"
+  role = aws_iam_role.ec2_ssm_role.name
+}
+Note: EC2 instances use the instance profile, not the role directly, to assume permissions.
+________________________________________
+Step 2: Configure Networking (VPC Endpoints)
+EC2 instances have no public IP, so SSM requires VPC endpoints:
+resource "aws_vpc_endpoint" "ssm" {
+  vpc_id            = var.vpc_id
+  service_name      = "com.amazonaws.${var.region}.ssm"
+  vpc_endpoint_type = "Interface"
+  subnet_ids        = var.private_subnet_ids
+  security_group_ids = [var.sg_id]
+}
+
+resource "aws_vpc_endpoint" "ec2messages" {
+  vpc_id            = var.vpc_id
+  service_name      = "com.amazonaws.${var.region}.ec2messages"
+  vpc_endpoint_type = "Interface"
+  subnet_ids        = var.private_subnet_ids
+  security_group_ids = [var.sg_id]
+}
+
+resource "aws_vpc_endpoint" "ssmmessages" {
+  vpc_id            = var.vpc_id
+  service_name      = "com.amazonaws.${var.region}.ssmmessages"
+  vpc_endpoint_type = "Interface"
+  subnet_ids        = var.private_subnet_ids
+  security_group_ids = [var.sg_id]
+}
+
+# Optional KMS endpoint if SSM session encryption is needed
+resource "aws_vpc_endpoint" "kms" {
+  vpc_id            = var.vpc_id
+  service_name      = "com.amazonaws.${var.region}.kms"
+  vpc_endpoint_type = "Interface"
+  subnet_ids        = var.private_subnet_ids
+  security_group_ids = [var.sg_id]
+}
+Security Group Requirements:
+•	Allow inbound TCP 443 from the private subnet CIDRs.
+•	Ensures SSM can reach the EC2 instance via VPC endpoints.
+________________________________________
+Step 3: Create Cross-Account IAM Role in Account-B for Account-A
+Account-A will assume this role to send SSM commands to EC2 in Account-B.
+resource "aws_iam_role" "cross_account_ssm_role" {
+  name = "CrossAccountSSMRole"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17",
+    Statement = [{
+      Effect = "Allow",
+      Principal = { AWS = "arn:aws:iam::ACCOUNT_A_ID:root" },
+      Action = "sts:AssumeRole"
+    }]
+  })
+}
+
+resource "aws_iam_role_policy" "cross_account_ssm_policy" {
+  name = "CrossAccountSSMPolicy"
+  role = aws_iam_role.cross_account_ssm_role.id
+
+  policy = jsonencode({
+    Version = "2012-10-17",
+    Statement = [{
+      Effect = "Allow",
+      Action = [
+        "ssm:SendCommand",
+        "ssm:GetCommandInvocation",
+        "ssm:ListCommands",
+        "ssm:DescribeInstanceInformation"
+      ],
+      Resource = "*"
+    }]
+  })
+}
+________________________________________
+Step 4: Terraform Provider Configuration (Account-A)
+To allow Terraform in Account-A to interact with resources in Account-B:
+provider "aws" {
+  alias  = "account_b"
+  region = "us-east-1"
+
+  assume_role {
+    role_arn     = "arn:aws:iam::ACCOUNT_B_ID:role/CrossAccountSSMRole"
+    session_name = "TerraformSSMSession"
+  }
+}
+Example: Terraform SSM Command in Account-B
+resource "aws_ssm_command" "test_command" {
+  provider        = aws.account_b
+  targets {
+    key    = "InstanceIds"
+    values = ["i-0123456789abcdef0"] # Replace with EC2 IDs
+  }
+  document_name = "AWS-RunShellScript"
+  parameters = {
+    commands = ["echo Hello from Terraform in Account-A"]
+  }
+}
+________________________________________
+Step 5: Assume Role from Account-A (Ansible / Orchestration)
+For orchestration tools like Ansible, you need to explicitly assume the cross-account role:
+- name: Assume cross-account role in Account-B
+  amazon.aws.sts_assume_role:
+    role_arn: "arn:aws:iam::ACCOUNT_B_ID:role/CrossAccountSSMRole"
+    role_session_name: "SSMSession"
+  register: assumed_role
+
+- name: Run command on EC2 in Account-B via SSM
+  amazon.aws.aws_ssm:
+    targets:
+      - Key: "InstanceIds"
+        Values:
+          - "i-0123456789abcdef0"  # Replace with EC2 instance IDs
+    document_name: "AWS-RunShellScript"
+    parameters:
+      commands:
+        - echo "Hello from Account-A"
+  aws_access_key: "{{ assumed_role.sts_creds.access_key }}"
+  aws_secret_key: "{{ assumed_role.sts_creds.secret_key }}"
+  security_token: "{{ assumed_role.sts_creds.session_token }}"
+  region: "us-east-1"
+This ensures explicit cross-account access with temporary credentials.
+________________________________________
+Step 6: EC2 Launch (Private, SSM-Enabled)
+Launch the EC2 instance in a private subnet with the SSM IAM instance profile.
+resource "aws_instance" "app" {
+  ami                    = var.ami_id
+  instance_type          = "t3.micro"
+  subnet_id              = var.private_subnet_id
+  iam_instance_profile   = aws_iam_instance_profile.ec2_ssm_profile.name
+  associate_public_ip_address = false
+
+  tags = {
+    Name = "SSMManagedInstance"
+  }
+}
+Notes:
+•	Ensure VPC endpoints (Step 2) are active before launching the instance.
+•	Instance automatically registers with SSM and can be managed without SSH.
+________________________________________
+Step 7: Verification
+1.	From Account-A, assume the CrossAccountSSMRole.
+2.	Execute a test command using SSM (via Terraform or Ansible).
+3.	Confirm the EC2 instance responds without a public IP.
+________________________________________
+Networking Requirements
+•	Private Subnet for EC2 (no public IP).
+•	VPC Endpoints: ssm, ssmmessages, ec2messages. Optional: kms.
+•	Security Groups: Allow inbound TCP 443 from private subnets.
+•	NAT Gateway: Optional if VPC endpoints are not used (not recommended).
+________________________________________
+Benefits
+•	Secure: No public IPs, no SSH access.
+•	Cross-Account Management: Centralized orchestration from Account-A.
+•	Compliance-Friendly: All traffic flows through private AWS channels.
+•	Automation-Ready: Works with Terraform, Ansible, Octopus, Chef, etc.
+
