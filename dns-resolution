@@ -1,0 +1,164 @@
+Scenario 1: AWS Cross-Account Private DNS Resolution
+
+Goal: Applications in Account B (multiple VPCs/regions) resolve private DNS records (xyz.com) hosted in Account A.
+
+Step 1: Share Private Hosted Zone via AWS RAM
+
+Login to Account A (Hosted Zone Owner):
+
+Go to Route 53 → Hosted Zones → xyz.com (Private).
+
+Click “Actions → Share via AWS RAM”.
+
+Select accounts/OU to share with (Account B).
+
+Confirm and share.
+
+In Account B (DNS Consumers):
+
+Accept the shared resource in AWS RAM.
+
+Go to Route 53 → Hosted Zones → Associate VPCs.
+
+Select each VPC (London, Ohio, etc.) to associate with the shared hosted zone.
+
+Verify DNS Resolution:
+
+From an EC2 instance or EKS pod in Account B:
+
+nslookup service.xyz.com
+
+
+It should resolve the private IPs defined in Account A’s hosted zone.
+
+Step 2 (Alternative): Using Route 53 Resolver Endpoints
+
+Only needed if sharing is not desired or you want central resolver control.
+
+In Account A:
+
+Create a Route 53 Resolver Inbound Endpoint in the VPC where xyz.com resides.
+
+Allocate 1–2 elastic IPs (for high availability).
+
+In Account B (per VPC):
+
+Create Route 53 Resolver Outbound Endpoints.
+
+Create a Forwarding Rule for xyz.com pointing to Account A’s inbound endpoint IPs.
+
+Associate this rule with the VPC.
+
+Test DNS resolution:
+
+EC2 or pod should resolve xyz.com via the forwarding rule.
+
+Scenario 2: AWS → On-Prem DNS Resolution
+
+Goal: Applications on AWS VPCs resolve abc.org DNS hosted on-premises.
+
+Step 1: Ensure network connectivity
+
+VPN (AWS Site-to-Site VPN) or AWS Direct Connect is required between AWS VPCs and on-prem network.
+
+Ensure security groups and firewalls allow DNS (UDP/TCP port 53).
+
+Step 2: Create Route 53 Resolver Outbound Endpoint in AWS
+
+In each VPC in Account B:
+
+Go to Route 53 → Resolver → Outbound Endpoints → Create.
+
+Allocate 1–2 ENIs in private subnets.
+
+Assign security groups allowing outbound DNS traffic to on-prem DNS servers.
+
+Step 3: Create Resolver Forwarding Rules
+
+Create a Forwarding Rule:
+
+Domain name: abc.org
+
+Target IP: On-prem DNS server IPs
+
+Associate the rule with each VPC where apps need resolution.
+
+Step 4: Test DNS Resolution
+
+From an EC2 instance or EKS pod:
+
+nslookup server.abc.org
+
+
+Should resolve to on-prem IPs.
+
+Architecture Diagram
+
+Here’s a detailed diagram showing both scenarios:
+
+                          ┌───────────────────┐
+                          │   Account A       │
+                          │ Private Hosted    │
+                          │ Zone: xyz.com     │
+                          │                   │
+                          │ ┌─────────────┐   │
+                          │ │Inbound      │   │
+                          │ │Resolver EP  │   │
+                          │ └─────────────┘   │
+                          └─────────┬─────────┘
+                                    │
+                                    │ (DNS queries)
+                                    │
+                          ┌─────────▼─────────┐
+                          │   Account B       │
+                          │   VPC-A (London)  │
+                          │   VPC-B (Ohio)    │
+                          │                   │
+     ┌─────────────┐      │ ┌─────────────┐   │
+     │ EKS/EC2 Pod │<---->│ │Outbound     │   │
+     │             │      │ │Resolver EP  │   │
+     └─────────────┘      │ └─────────────┘   │
+                          │   Resolver Rule   │
+                          │  xyz.com → A      │
+                          └─────────┬─────────┘
+                                    │
+                                    │ (optional if using RAM)
+                                    │
+                          ┌─────────▼─────────┐
+                          │ AWS RAM Shared    │
+                          │ Private Hosted    │
+                          │ Zone Association │
+                          └───────────────────┘
+
+---------------------------------------------
+          Hybrid: AWS → On-Prem
+---------------------------------------------
+                          ┌──────────────┐
+                          │ On-Prem DC   │
+                          │ abc.org DNS  │
+                          └─────┬────────┘
+                                │
+                         (UDP/TCP 53)
+                                │
+                          ┌─────▼─────────┐
+                          │ VPC-A / VPC-B │
+                          │ Outbound EP    │
+                          │ Resolver Rule  │
+                          │ abc.org → DC   │
+                          └─────┬─────────┘
+                                │
+                          ┌─────▼─────────┐
+                          │ EKS/EC2 Pod    │
+                          │ AWS Apps       │
+                          └───────────────┘
+
+
+✅ Key Points:
+
+Private Hosted Zone Sharing is the simplest for intra-AWS cross-account DNS.
+
+Resolver endpoints + forwarding rules give more flexibility, multi-region support, and hybrid connectivity.
+
+Security Groups must allow DNS traffic between VPCs/endpoints and on-premises.
+
+EKS pods use VPC DNS by default; no extra config is needed if VPC is associated with shared zone or resolver rules.
